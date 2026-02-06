@@ -1,7 +1,13 @@
 # -*- coding: utf-8 -*-
 """
-Guardian Life Career Scraper - GitHub Actions Version
-Runs automatically on scheduled days via GitHub Actions
+Guardian Life Career Scraper - Upgraded Version
+Features:
+- Professional Excel export with formatting
+- CSV backup export
+- Scheduled execution
+- Automatic folder management
+- Error handling and logging
+- Run history tracking
 """
 
 from bs4 import BeautifulSoup
@@ -12,25 +18,30 @@ import os
 from datetime import datetime, timedelta
 from openpyxl import load_workbook
 from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
 import json
 import logging
 
 # ============================================================================
-# CONFIGURATION - GitHub Actions Version
+# CONFIGURATION SECTION - MODIFY THESE VALUES
 # ============================================================================
 
-# Schedule is handled by GitHub Actions cron
-# See .github/workflows/scraper.yml to change schedule
+# Schedule Configuration (Set which days to run)
+SCHEDULE_CONFIG = {
+    'enabled': True,  # Set to False to run every time
+    'run_days': [0, 2, 4],  # 0=Monday, 1=Tuesday, 2=Wednesday, 3=Thursday, 4=Friday, 5=Saturday, 6=Sunday
+}
 
-# Path Configuration (local folders, not Google Drive)
-OUTPUT_FOLDER = 'output'
-LOG_FOLDER = 'logs'
+# Path Configuration (for Google Colab)
+OUTPUT_BASE_PATH = '/content/drive/MyDrive/Company Project/Career Page Automations'
+OUTPUT_FOLDER = 'GuardianLife_Jobs'  # Subfolder for Guardian Life jobs
+LOG_FOLDER = 'logs'  # Subfolder for logs
 
 # Export Configuration
 EXPORT_CONFIG = {
-    'save_excel': True,
-    'save_csv': True,
-    'save_json': True,  # Enabled for GitHub history
+    'save_excel': True,  # Save formatted Excel file
+    'save_csv': True,    # Save CSV backup
+    'save_json': False,  # Save raw JSON data
 }
 
 # ============================================================================
@@ -39,14 +50,25 @@ EXPORT_CONFIG = {
 
 def setup_folders():
     """Create necessary folders if they don't exist"""
-    folders = [OUTPUT_FOLDER, LOG_FOLDER]
+    base_path = OUTPUT_BASE_PATH
+    folders = [
+        OUTPUT_FOLDER,
+        LOG_FOLDER,
+        f'{OUTPUT_FOLDER}/archive'  # For old files
+    ]
+    
+    created_folders = []
     for folder in folders:
-        if not os.path.exists(folder):
-            os.makedirs(folder)
+        folder_path = os.path.join(base_path, folder)
+        if not os.path.exists(folder_path):
+            os.makedirs(folder_path)
+            created_folders.append(folder)
+    
+    return created_folders
 
 def setup_logging():
     """Setup logging configuration"""
-    log_path = os.path.join(LOG_FOLDER, f'scraper_{get_timestamp()}.log')
+    log_path = os.path.join(OUTPUT_BASE_PATH, LOG_FOLDER, f'scraper_{get_timestamp()}.log')
     
     logging.basicConfig(
         level=logging.INFO,
@@ -66,9 +88,23 @@ def get_date_only():
     """Get current date in IST"""
     return (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime('%Y-%m-%d')
 
+def should_run_today():
+    """Check if script should run today based on schedule"""
+    if not SCHEDULE_CONFIG['enabled']:
+        return True, "Schedule disabled - running"
+    
+    today = (datetime.utcnow() + timedelta(hours=5, minutes=30)).weekday()
+    day_names = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+    
+    if today in SCHEDULE_CONFIG['run_days']:
+        return True, f"Scheduled run - Today is {day_names[today]}"
+    else:
+        scheduled_days = [day_names[d] for d in SCHEDULE_CONFIG['run_days']]
+        return False, f"Not scheduled - Today is {day_names[today]}, scheduled days: {', '.join(scheduled_days)}"
+
 def save_run_history(status, records_count=0, error=None):
     """Save run history to JSON file"""
-    history_file = os.path.join(LOG_FOLDER, 'run_history.json')
+    history_file = os.path.join(OUTPUT_BASE_PATH, LOG_FOLDER, 'run_history.json')
     
     history_entry = {
         'timestamp': get_timestamp(),
@@ -78,6 +114,7 @@ def save_run_history(status, records_count=0, error=None):
         'error': str(error) if error else None
     }
     
+    # Load existing history
     history = []
     if os.path.exists(history_file):
         try:
@@ -86,8 +123,10 @@ def save_run_history(status, records_count=0, error=None):
         except:
             history = []
     
+    # Append new entry
     history.append(history_entry)
     
+    # Save updated history
     with open(history_file, 'w') as f:
         json.dump(history, f, indent=2)
 
@@ -159,6 +198,7 @@ def scrape_jobs():
     """Main scraping function"""
     logger.info("Starting job scraping...")
     
+    # Collect role listings
     collect_list_roles = []
     for i in tqdm(range(0, 500, 20), desc='Collecting Roles'):
         results = role_list_collect(i)
@@ -173,8 +213,10 @@ def scrape_jobs():
         logger.warning("No jobs found")
         return None
     
+    # Create roles dataframe
     roles_df = pd.json_normalize(collect_list_roles).drop_duplicates(['bulletFields'])
     
+    # Collect detailed information
     collect_role_details = []
     for perma in tqdm(roles_df['externalPath'], desc='Collecting Details'):
         result = role_details_fetch(perma)
@@ -182,13 +224,17 @@ def scrape_jobs():
             result['perma'] = perma
             collect_role_details.append(result)
     
+    # Create details dataframe
     roledetails_df = pd.json_normalize(collect_role_details)
     
+    # Clean HTML from job descriptions
     if 'jobPostingInfo.jobDescription' in roledetails_df.columns:
         roledetails_df['jobPostingInfo.jobDescription'] = roledetails_df['jobPostingInfo.jobDescription'].apply(extract_text_from_html)
     
+    # Merge dataframes
     final_df = pd.merge(roles_df, roledetails_df, left_on='externalPath', right_on='perma', how='left')
     
+    # Select and rename columns
     column_mapping = {
         'jobPostingInfo.title': 'Job Title',
         'jobPostingInfo.jobDescription': 'Job Description',
@@ -200,12 +246,14 @@ def scrape_jobs():
         'jobPostingInfo.externalUrl': 'Application URL'
     }
     
+    # Filter columns that exist
     available_cols = [col for col in column_mapping.keys() if col in final_df.columns]
     final_df = final_df[available_cols]
     final_df = final_df.rename(columns=column_mapping)
     
-    final_df.insert(0, 'Scraped Date', get_date_only())
-    final_df.insert(1, 'Scraped Time', get_timestamp())
+    # Scraping metadata columns removed as per user request
+    # final_df.insert(0, 'Scraped Date', get_date_only())
+    # final_df.insert(1, 'Scraped Time', get_timestamp())
     
     logger.info(f"Successfully processed {len(final_df)} job records")
     
@@ -220,6 +268,7 @@ def format_excel(file_path):
     wb = load_workbook(file_path)
     ws = wb.active
     
+    # Define styles
     header_font = Font(name='Arial', size=11, bold=True, color='FFFFFF')
     header_fill = PatternFill(start_color='366092', end_color='366092', fill_type='solid')
     header_alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
@@ -234,27 +283,39 @@ def format_excel(file_path):
         bottom=Side(style='thin', color='D3D3D3')
     )
     
+    # Format header row
     for cell in ws[1]:
         cell.font = header_font
         cell.fill = header_fill
         cell.alignment = header_alignment
         cell.border = thin_border
     
+    # Format data rows
     for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
         for cell in row:
             cell.font = cell_font
             cell.alignment = cell_alignment
             cell.border = thin_border
     
+    # Adjust column widths
     column_widths = {
-        'A': 12, 'B': 18, 'C': 35, 'D': 60, 'E': 20,
-        'F': 20, 'G': 12, 'H': 15, 'I': 15, 'J': 50,
+        'A': 35,  # Job Title
+        'B': 60,  # Job Description
+        'C': 20,  # Location
+        'D': 20,  # Additional Locations
+        'E': 12,  # Start Date
+        'F': 15,  # Job ID
+        'G': 15,  # Remote Type
+        'H': 50,  # Application URL
     }
     
     for col, width in column_widths.items():
         ws.column_dimensions[col].width = width
     
+    # Freeze header row
     ws.freeze_panes = 'A2'
+    
+    # Set row height for header
     ws.row_dimensions[1].height = 30
     
     wb.save(file_path)
@@ -264,29 +325,33 @@ def export_data(df):
     """Export data in configured formats"""
     timestamp = get_timestamp()
     date_only = get_date_only()
+    output_path = os.path.join(OUTPUT_BASE_PATH, OUTPUT_FOLDER)
     
     exported_files = []
     
+    # Export Excel
     if EXPORT_CONFIG['save_excel']:
         excel_filename = f'GuardianLife_Jobs_{date_only}.xlsx'
-        excel_path = os.path.join(OUTPUT_FOLDER, excel_filename)
+        excel_path = os.path.join(output_path, excel_filename)
         
         df.to_excel(excel_path, index=False, engine='openpyxl')
         format_excel(excel_path)
         exported_files.append(excel_path)
         logger.info(f"Excel file saved: {excel_filename}")
     
+    # Export CSV
     if EXPORT_CONFIG['save_csv']:
         csv_filename = f'GuardianLife_Jobs_{date_only}.csv'
-        csv_path = os.path.join(OUTPUT_FOLDER, csv_filename)
+        csv_path = os.path.join(output_path, csv_filename)
         
         df.to_csv(csv_path, index=False, encoding='utf-8-sig')
         exported_files.append(csv_path)
         logger.info(f"CSV file saved: {csv_filename}")
     
+    # Export JSON (raw data backup)
     if EXPORT_CONFIG['save_json']:
         json_filename = f'GuardianLife_Jobs_{date_only}.json'
-        json_path = os.path.join(OUTPUT_FOLDER, json_filename)
+        json_path = os.path.join(output_path, json_filename)
         
         df.to_json(json_path, orient='records', indent=2)
         exported_files.append(json_path)
@@ -302,14 +367,32 @@ def main():
     """Main execution function"""
     global logger
     
-    setup_folders()
-    logger = setup_logging()
+    # Setup folders
+    print("Setting up folders...")
+    created_folders = setup_folders()
+    if created_folders:
+        print(f"Created folders: {', '.join(created_folders)}")
     
+    # Setup logging
+    logger = setup_logging()
     logger.info("="*70)
-    logger.info("Guardian Life Career Scraper - GitHub Actions Auto Run")
+    logger.info("Guardian Life Career Scraper - Starting")
     logger.info("="*70)
+    
+    # Check if should run today
+    should_run, reason = should_run_today()
+    logger.info(reason)
+    
+    if not should_run:
+        print(f"\n❌ {reason}")
+        print(f"Scheduled days: {SCHEDULE_CONFIG['run_days']} (0=Mon, 1=Tue, 2=Wed, 3=Thu, 4=Fri, 5=Sat, 6=Sun)")
+        save_run_history('skipped')
+        return
+    
+    print(f"\n✅ {reason}")
     
     try:
+        # Scrape jobs
         df = scrape_jobs()
         
         if df is None or len(df) == 0:
@@ -318,8 +401,10 @@ def main():
             print("\n⚠️  No jobs found")
             return
         
+        # Export data
         exported_files = export_data(df)
         
+        # Success summary
         logger.info("="*70)
         logger.info(f"✅ Scraping completed successfully!")
         logger.info(f"Total jobs scraped: {len(df)}")
@@ -328,13 +413,15 @@ def main():
             logger.info(f"  - {os.path.basename(file)}")
         logger.info("="*70)
         
+        # Save run history
         save_run_history('success', len(df))
         
+        # Print summary
         print(f"\n{'='*70}")
         print(f"✅ SUCCESS!")
         print(f"{'='*70}")
         print(f"Jobs scraped: {len(df)}")
-        print(f"Files saved in: {OUTPUT_FOLDER}/")
+        print(f"Files saved in: {os.path.join(OUTPUT_BASE_PATH, OUTPUT_FOLDER)}")
         for file in exported_files:
             print(f"  📄 {os.path.basename(file)}")
         print(f"{'='*70}\n")
